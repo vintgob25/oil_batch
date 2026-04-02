@@ -13,7 +13,7 @@ from typing import Any
 
 import fitz  # PyMuPDF
 import pandas as pd
-from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
+from openai import APIConnectionError, APITimeoutError, OpenAI
 from rapidfuzz import fuzz, process
 from dotenv import load_dotenv
 
@@ -96,7 +96,7 @@ def ensure_required_columns(df: pd.DataFrame) -> None:
 
 
 
-def pdf_to_images(pdf_path: Path, output_dir: Path, dpi: int = 200) -> list[Path]:
+def pdf_to_images(pdf_path: Path, output_dir: Path, dpi: int = 140) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     doc = fitz.open(pdf_path)
     image_paths: list[Path] = []
@@ -165,7 +165,7 @@ def parse_page_with_ai(image_path: Path) -> list[dict[str, Any]]:
         return []
 
     image_base64 = image_to_base64(image_path)
-    client = OpenAI(api_key=api_key, timeout=60.0, max_retries=0)
+    client = OpenAI(api_key=api_key, timeout=120.0, max_retries=0)
     prompt = (
         "Ты анализируешь скан страницы заказа и должен извлечь batch-коды максимально точно.\n"
         "Важные правила:\n"
@@ -181,11 +181,11 @@ def parse_page_with_ai(image_path: Path) -> list[dict[str, Any]]:
         "Без markdown, без комментариев, без любого текста вне JSON."
     )
 
-    max_attempts = 3
+    max_attempts = 4
     response = None
     for attempt in range(1, max_attempts + 1):
         if attempt > 1:
-            sleep_seconds = 2 ** (attempt - 2)  # 1s, 2s before 2-й и 3-й попытками
+            sleep_seconds = 2 ** (attempt - 1)  # 2s, 4s, 8s before retries
             logger.warning(
                 "Retrying OpenAI call for %s: attempt %s/%s in %ss",
                 image_path,
@@ -238,32 +238,6 @@ def parse_page_with_ai(image_path: Path) -> list[dict[str, Any]]:
                 },
             )
             break
-        except APIStatusError as exc:
-            status_code = exc.status_code or 0
-            if 400 <= status_code < 500:
-                logger.error(
-                    "OpenAI вернул неретраибельную ошибку %s для %s: %s",
-                    status_code,
-                    image_path,
-                    exc,
-                )
-                return []
-            if attempt == max_attempts:
-                logger.exception(
-                    "OpenAI APIStatusError после %s попыток для %s: %s",
-                    max_attempts,
-                    image_path,
-                    exc,
-                )
-                return []
-            logger.warning(
-                "Временная ошибка OpenAI API (status=%s) на попытке %s/%s для %s: %s",
-                status_code,
-                attempt,
-                max_attempts,
-                image_path,
-                exc,
-            )
         except (APITimeoutError, APIConnectionError) as exc:
             if attempt == max_attempts:
                 logger.exception(
@@ -394,6 +368,20 @@ def parse_pdf(pdf_path: Path, work_dir: Path, confidence_threshold: float) -> li
 
     results: list[ParsedLine] = []
 
+    checkpoint_path = work_dir / "parsed_lines_checkpoint.json"
+
+    def save_checkpoint() -> None:
+        try:
+            work_dir.mkdir(parents=True, exist_ok=True)
+            checkpoint_payload = [asdict(line) for line in results]
+            checkpoint_path.write_text(
+                json.dumps(checkpoint_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            logger.info("Checkpoint saved after page processing: %s", checkpoint_path)
+        except Exception as exc:
+            logger.warning("Failed to save checkpoint %s: %s", checkpoint_path, exc)
+
     for page_no, image_path in enumerate(image_paths, start=1):
         logger.info("Processing page %s (%s)", page_no, image_path.name)
         raw_items = parse_page_with_ai(image_path)
@@ -414,6 +402,9 @@ def parse_pdf(pdf_path: Path, work_dir: Path, confidence_threshold: float) -> li
                     status="review",
                 )
             )
+            save_checkpoint()
+            if page_no < len(image_paths):
+                time.sleep(1)
             continue
 
         for item in raw_items:
@@ -443,6 +434,10 @@ def parse_pdf(pdf_path: Path, work_dir: Path, confidence_threshold: float) -> li
                     status=status,
                 )
             )
+
+        save_checkpoint()
+        if page_no < len(image_paths):
+            time.sleep(1)
 
     return results
 
