@@ -6,13 +6,14 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
 import fitz  # PyMuPDF
 import pandas as pd
-from openai import OpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 from dotenv import load_dotenv
 
 # =========================
@@ -162,60 +163,149 @@ def parse_page_with_ai(image_path: Path) -> list[dict[str, Any]]:
         return []
 
     image_base64 = image_to_base64(image_path)
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, timeout=60.0, max_retries=0)
     prompt = (
-        "Ты анализируешь скан страницы заказа. "
-        "Найди все товарные строки и рукописные batch-коды рядом с каждой строкой. "
-        "Верни СТРОГО JSON-массив объектов: "
-        '[{"product":"...","qty_raw":"...","batch":"...","confidence":0.0,"reason":"..."}]. '
-        "Если batch не читается, верни пустую строку для batch и снизь confidence. "
-        "Не добавляй комментарии, markdown или другой текст."
+        "Ты анализируешь скан страницы заказа и должен извлечь batch-коды максимально точно.\n"
+        "Важные правила:\n"
+        "1) Для каждой товарной строки найди batch ТОЛЬКО как рукописный код на той же горизонтальной линии, "
+        "справа или непосредственно рядом с этой строкой.\n"
+        "2) Batch должен выглядеть как код (смесь букв и цифр, без случайных слов).\n"
+        "3) Игнорируй посторонние пометки и шум: слова вроде 'neo', стрелки, служебные заметки, каракули.\n"
+        "4) Не угадывай batch. Если код не виден или есть сомнение — верни пустую строку \"\" и низкий confidence.\n"
+        "5) Не придумывай значения и не копируй код с другой строки.\n"
+        "6) В reason кратко укажи, почему уверен/не уверен (например: 'код справа на одной линии' или 'нечитаемо').\n"
+        "Верни СТРОГО JSON-объект формата: "
+        '{"rows":[{"product":"...","qty_raw":"...","batch":"...","confidence":0.0,"reason":"..."}]}. '
+        "Без markdown, без комментариев, без любого текста вне JSON."
     )
 
-    try:
-        response = client.responses.create(
-            model=model_name,
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": prompt},
-                        {"type": "input_image", "image_url": f"data:image/png;base64,{image_base64}"},
-                    ],
-                }
-            ],
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "batch_rows",
-                    "schema": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "rows": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "additionalProperties": False,
-                                    "properties": {
-                                        "product": {"type": "string"},
-                                        "qty_raw": {"type": "string"},
-                                        "batch": {"type": "string"},
-                                        "confidence": {"type": "number"},
-                                        "reason": {"type": "string"},
-                                   },
-                                   "required": ["product", "qty_raw", "batch", "confidence", "reason"],
+    max_attempts = 3
+    response = None
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            sleep_seconds = 2 ** (attempt - 2)  # 1s, 2s before 2-й и 3-й попытками
+            logger.warning(
+                "Retrying OpenAI call for %s: attempt %s/%s in %ss",
+                image_path,
+                attempt,
+                max_attempts,
+                sleep_seconds,
+            )
+            time.sleep(sleep_seconds)
+
+        try:
+            response = client.responses.create(
+                model=model_name,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": prompt},
+                            {"type": "input_image", "image_url": f"data:image/png;base64,{image_base64}"},
+                        ],
+                    }
+                ],
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "batch_rows",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "rows": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "properties": {
+                                            "product": {"type": "string"},
+                                            "qty_raw": {"type": "string"},
+                                            "batch": {"type": "string"},
+                                            "confidence": {"type": "number"},
+                                            "reason": {"type": "string"},
+                                       },
+                                       "required": ["product", "qty_raw", "batch", "confidence", "reason"],
+                                    },
                                 },
-                            }
+                            },
+                            "required": ["rows"],
                         },
-                        "required": ["rows"],
-                    },
-                    "strict": True,
-                }
-            },
-        )
-    except Exception as exc:
-        logger.exception("Ошибка вызова vision-модели для %s: %s", image_path, exc)
+                        "strict": True,
+                    }
+                },
+            )
+            break
+        except APIStatusError as exc:
+            status_code = exc.status_code or 0
+            if 400 <= status_code < 500:
+                logger.error(
+                    "OpenAI вернул неретраибельную ошибку %s для %s: %s",
+                    status_code,
+                    image_path,
+                    exc,
+                )
+                return []
+            if attempt == max_attempts:
+                logger.exception(
+                    "OpenAI APIStatusError после %s попыток для %s: %s",
+                    max_attempts,
+                    image_path,
+                    exc,
+                )
+                return []
+            logger.warning(
+                "Временная ошибка OpenAI API (status=%s) на попытке %s/%s для %s: %s",
+                status_code,
+                attempt,
+                max_attempts,
+                image_path,
+                exc,
+            )
+        except (APITimeoutError, APIConnectionError) as exc:
+            if attempt == max_attempts:
+                logger.exception(
+                    "OpenAI timeout/connect error после %s попыток для %s: %s",
+                    max_attempts,
+                    image_path,
+                    exc,
+                )
+                return []
+            logger.warning(
+                "Timeout/connect ошибка OpenAI на попытке %s/%s для %s: %s",
+                attempt,
+                max_attempts,
+                image_path,
+                exc,
+            )
+        except Exception as exc:
+            err_text = str(exc).lower()
+            is_retryable_network = any(
+                marker in err_text
+                for marker in ("timeout", "connecttimeout", "handshake", "ssl", "connection reset")
+            )
+            if is_retryable_network and attempt < max_attempts:
+                logger.warning(
+                    "Временная сетевая ошибка OpenAI на попытке %s/%s для %s: %s",
+                    attempt,
+                    max_attempts,
+                    image_path,
+                    exc,
+                )
+                continue
+            if is_retryable_network:
+                logger.exception(
+                    "OpenAI сетевая ошибка после %s попыток для %s: %s",
+                    max_attempts,
+                    image_path,
+                    exc,
+                )
+                return []
+            logger.exception("Ошибка вызова vision-модели для %s: %s", image_path, exc)
+            return []
+
+    if response is None:
+        logger.error("OpenAI не вернул ответ после %s попыток для %s", max_attempts, image_path)
         return []
 
     raw_text = getattr(response, "output_text", "") or ""
@@ -223,26 +313,30 @@ def parse_page_with_ai(image_path: Path) -> list[dict[str, Any]]:
     write_debug_payload({"image": str(image_path), "raw_response": raw_text}, "raw_response")
     try:
         payload = json.loads(raw_text)
-        rows = payload.get("rows", []) if isinstance(payload, dict) else []
     except Exception as exc:
         logger.exception("Невалидный JSON от модели для %s: %s; raw=%r", image_path, exc, raw_text[:500])
         return []
 
-    if not isinstance(rows, list):
-        logger.error("Ожидался список объектов, но получено: %s", type(payload).__name__)
+    if not isinstance(payload, dict):
+        logger.error("Ожидался объект JSON верхнего уровня, но получено: %s", type(payload).__name__)
         return []
 
-    normalized_items: list[dict[str, Any]] = []
-    for idx, item in enumerate(payload):
+    rows = payload.get("rows", [])
+    if not isinstance(rows, list):
+        logger.error("Поле 'rows' должно быть списком, но получено: %s", type(rows).__name__)
+        return []
+
+    normalized_rows: list[dict[str, Any]] = []
+    for idx, item in enumerate(rows):
         if not isinstance(item, dict):
             logger.error("Элемент #%s не объект: %r", idx, item)
             return []
         try:
-            normalized_items.append(
+            normalized_rows.append(
                 {
                     "product": str(item.get("product", "")).strip(),
                     "qty_raw": str(item.get("qty_raw", "")).strip(),
-                    "batch": normalize_batch(str(item.get("batch", ""))),
+                    "batch": str(item.get("batch", "")).strip(),
                     "confidence": float(item.get("confidence", 0.0) or 0.0),
                     "reason": str(item.get("reason", "")).strip(),
                 }
@@ -251,9 +345,9 @@ def parse_page_with_ai(image_path: Path) -> list[dict[str, Any]]:
             logger.exception("Не удалось нормализовать элемент #%s: %r, err=%s", idx, item, exc)
             return []
 
-    write_debug_payload(normalized_items, "normalized_rows")
-    logger.info("Parsed %s rows from %s", len(normalized_items), image_path)
-    return normalized_items
+    write_debug_payload(normalized_rows, "normalized_rows")
+    logger.info("Parsed %s rows from %s", len(normalized_rows), image_path)
+    return normalized_rows
 
 
 # =========================
@@ -348,7 +442,11 @@ def build_updates(parsed_lines: list[ParsedLine], batch_df: pd.DataFrame) -> tup
     for _, row in df.iterrows():
         batch = normalize_batch(row.get("batch"))
         qty_value = row.get("qty_value")
-        qty_unit = (row.get("qty_unit") or "").lower()
+        qty_unit_raw = row.get("qty_unit")
+        if pd.isna(qty_unit_raw):
+            qty_unit = ""
+        else:
+            qty_unit = str(qty_unit_raw).lower()
         base_status = row.get("status", "review")
 
         out_row = row.to_dict()
