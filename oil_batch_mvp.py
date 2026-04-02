@@ -223,26 +223,30 @@ def parse_page_with_ai(image_path: Path) -> list[dict[str, Any]]:
     write_debug_payload({"image": str(image_path), "raw_response": raw_text}, "raw_response")
     try:
         payload = json.loads(raw_text)
-        rows = payload.get("rows", []) if isinstance(payload, dict) else []
     except Exception as exc:
         logger.exception("Невалидный JSON от модели для %s: %s; raw=%r", image_path, exc, raw_text[:500])
         return []
 
-    if not isinstance(rows, list):
-        logger.error("Ожидался список объектов, но получено: %s", type(payload).__name__)
+    if not isinstance(payload, dict):
+        logger.error("Ожидался объект JSON верхнего уровня, но получено: %s", type(payload).__name__)
         return []
 
-    normalized_items: list[dict[str, Any]] = []
-    for idx, item in enumerate(payload):
+    rows = payload.get("rows", [])
+    if not isinstance(rows, list):
+        logger.error("Поле 'rows' должно быть списком, но получено: %s", type(rows).__name__)
+        return []
+
+    normalized_rows: list[dict[str, Any]] = []
+    for idx, item in enumerate(rows):
         if not isinstance(item, dict):
             logger.error("Элемент #%s не объект: %r", idx, item)
             return []
         try:
-            normalized_items.append(
+            normalized_rows.append(
                 {
                     "product": str(item.get("product", "")).strip(),
                     "qty_raw": str(item.get("qty_raw", "")).strip(),
-                    "batch": normalize_batch(str(item.get("batch", ""))),
+                    "batch": str(item.get("batch", "")).strip(),
                     "confidence": float(item.get("confidence", 0.0) or 0.0),
                     "reason": str(item.get("reason", "")).strip(),
                 }
@@ -251,9 +255,9 @@ def parse_page_with_ai(image_path: Path) -> list[dict[str, Any]]:
             logger.exception("Не удалось нормализовать элемент #%s: %r, err=%s", idx, item, exc)
             return []
 
-    write_debug_payload(normalized_items, "normalized_rows")
-    logger.info("Parsed %s rows from %s", len(normalized_items), image_path)
-    return normalized_items
+    write_debug_payload(normalized_rows, "normalized_rows")
+    logger.info("Parsed %s rows from %s", len(normalized_rows), image_path)
+    return normalized_rows
 
 
 # =========================
