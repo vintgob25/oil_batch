@@ -347,9 +347,42 @@ def parse_page_with_ai(image_path: Path) -> list[dict[str, Any]]:
             logger.exception("Не удалось нормализовать элемент #%s: %r, err=%s", idx, item, exc)
             return []
 
-    write_debug_payload(normalized_rows, "normalized_rows")
-    logger.info("Parsed %s rows from %s", len(normalized_rows), image_path)
-    return normalized_rows
+    filtered_rows: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str, str]] = set()
+    filtered_count = 0
+    garbage_markers = ("ngbc", "wholesale", "waterless")
+
+    for row in normalized_rows:
+        product = str(row.get("product", "")).strip()
+        qty_raw = str(row.get("qty_raw", "")).strip()
+        batch = str(row.get("batch", "")).strip()
+        confidence = float(row.get("confidence", 0.0) or 0.0)
+        qty_value, _ = parse_qty(qty_raw)
+
+        is_too_short = len(product) <= 3
+        has_garbage_marker = any(marker in product.lower() for marker in garbage_markers)
+        has_empty_or_zero_qty = (not qty_raw) or (qty_value in (None, 0.0))
+        has_empty_batch_low_conf = (not batch) and confidence < 0.5
+
+        if is_too_short or has_garbage_marker or has_empty_or_zero_qty or has_empty_batch_low_conf:
+            filtered_count += 1
+            continue
+
+        dedupe_key = (product.lower(), qty_raw.lower(), batch.lower())
+        if dedupe_key in seen_keys:
+            filtered_count += 1
+            continue
+        seen_keys.add(dedupe_key)
+        filtered_rows.append(row)
+
+    write_debug_payload(filtered_rows, "normalized_rows")
+    logger.info(
+        "Parsed %s rows from %s (filtered out %s garbage/duplicate rows)",
+        len(filtered_rows),
+        image_path,
+        filtered_count,
+    )
+    return filtered_rows
 
 
 # =========================
