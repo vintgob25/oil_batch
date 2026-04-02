@@ -26,6 +26,7 @@ RESULTS_SHEET_NAME = "PARSED_LINES"
 OPENAI_MODEL_ENV = "OPENAI_VISION_MODEL"
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+DEBUG_OUTPUT_DIR_ENV = "OIL_BATCH_DEBUG_DIR"
 logger = logging.getLogger(__name__)
 
 
@@ -130,6 +131,23 @@ def parse_page_with_ai(image_path: Path) -> list[dict[str, Any]]:
     """
     api_key = os.getenv(OPENAI_API_KEY_ENV, "").strip()
     model_name = os.getenv(OPENAI_MODEL_ENV, DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
+    debug_dir_raw = os.getenv(DEBUG_OUTPUT_DIR_ENV, "").strip()
+    debug_dir = Path(debug_dir_raw) if debug_dir_raw else None
+
+    logger.info("AI parse started for page image: %s", image_path)
+
+    def write_debug_payload(payload: Any, suffix: str) -> None:
+        if not debug_dir:
+            return
+        try:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            debug_path = debug_dir / f"{image_path.stem}_{suffix}.json"
+            with debug_path.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+            logger.info("Debug JSON saved: %s", debug_path)
+        except Exception as exc:
+            logger.warning("Failed to write debug JSON for %s: %s", image_path, exc)
+
     if not api_key:
         logger.error("Переменная окружения %s не задана. AI-разбор пропущен.", OPENAI_API_KEY_ENV)
         return []
@@ -185,6 +203,8 @@ def parse_page_with_ai(image_path: Path) -> list[dict[str, Any]]:
         return []
 
     raw_text = getattr(response, "output_text", "") or ""
+    logger.info("Raw model response for %s: %s", image_path, raw_text[:2000])
+    write_debug_payload({"image": str(image_path), "raw_response": raw_text}, "raw_response")
     try:
         payload = json.loads(raw_text)
     except Exception as exc:
@@ -214,6 +234,8 @@ def parse_page_with_ai(image_path: Path) -> list[dict[str, Any]]:
             logger.exception("Не удалось нормализовать элемент #%s: %r, err=%s", idx, item, exc)
             return []
 
+    write_debug_payload(normalized_items, "normalized_rows")
+    logger.info("Parsed %s rows from %s", len(normalized_items), image_path)
     return normalized_items
 
 
@@ -227,7 +249,9 @@ def parse_pdf(pdf_path: Path, work_dir: Path, confidence_threshold: float) -> li
     results: list[ParsedLine] = []
 
     for page_no, image_path in enumerate(image_paths, start=1):
+        logger.info("Processing page %s (%s)", page_no, image_path.name)
         raw_items = parse_page_with_ai(image_path)
+        logger.info("Page %s: recognized %s rows", page_no, len(raw_items))
 
         if not raw_items:
             results.append(

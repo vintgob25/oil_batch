@@ -37,12 +37,16 @@ pip install -r requirements.txt
 
 - `OPENAI_API_KEY` — API ключ (обязательно)
 - `OPENAI_VISION_MODEL` — имя модели (опционально, по умолчанию `gpt-4.1-mini`)
+- `OIL_BATCH_DEBUG_DIR` — опционально, папка для debug JSON по страницам (raw/normalized ответы модели)
 
 Пример:
 
 ```bash
-export OPENAI_API_KEY="sk-..."
-export OPENAI_VISION_MODEL="gpt-4.1-mini"
+cp .env.example .env
+# отредактируйте .env
+set -a
+source .env
+set +a
 ```
 
 ## Запуск
