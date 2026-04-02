@@ -13,7 +13,7 @@ from typing import Any
 import fitz  # PyMuPDF
 import pandas as pd
 from openai import OpenAI
-
+from dotenv import load_dotenv
 
 # =========================
 # CONFIG
@@ -28,7 +28,7 @@ OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
 DEBUG_OUTPUT_DIR_ENV = "OIL_BATCH_DEBUG_DIR"
 logger = logging.getLogger(__name__)
-
+load_dotenv()
 
 # =========================
 # DATA MODELS
@@ -50,10 +50,19 @@ class ParsedLine:
 # =========================
 # HELPERS
 # =========================
-def normalize_batch(value: str | None) -> str:
+def normalize_batch(value) -> str:
+    if value is None:
+        return ""
+
+    # pandas часто читает пустые ячейки как NaN (float)
+    if pd.isna(value):
+        return ""
+
+    value = str(value).strip()
     if not value:
         return ""
-    value = value.upper().strip()
+
+    value = value.upper()
     value = re.sub(r"\s+", "", value)
     value = re.sub(r"[^A-Z0-9-]", "", value)
     return value
@@ -180,19 +189,26 @@ def parse_page_with_ai(image_path: Path) -> list[dict[str, Any]]:
                     "type": "json_schema",
                     "name": "batch_rows",
                     "schema": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "product": {"type": "string"},
-                                "qty_raw": {"type": "string"},
-                                "batch": {"type": "string"},
-                                "confidence": {"type": "number"},
-                                "reason": {"type": "string"},
-                            },
-                            "required": ["product", "qty_raw", "batch", "confidence", "reason"],
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "rows": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "product": {"type": "string"},
+                                        "qty_raw": {"type": "string"},
+                                        "batch": {"type": "string"},
+                                        "confidence": {"type": "number"},
+                                        "reason": {"type": "string"},
+                                   },
+                                   "required": ["product", "qty_raw", "batch", "confidence", "reason"],
+                                },
+                            }
                         },
+                        "required": ["rows"],
                     },
                     "strict": True,
                 }
@@ -207,11 +223,12 @@ def parse_page_with_ai(image_path: Path) -> list[dict[str, Any]]:
     write_debug_payload({"image": str(image_path), "raw_response": raw_text}, "raw_response")
     try:
         payload = json.loads(raw_text)
+        rows = payload.get("rows", []) if isinstance(payload, dict) else []
     except Exception as exc:
         logger.exception("Невалидный JSON от модели для %s: %s; raw=%r", image_path, exc, raw_text[:500])
         return []
 
-    if not isinstance(payload, list):
+    if not isinstance(rows, list):
         logger.error("Ожидался список объектов, но получено: %s", type(payload).__name__)
         return []
 
@@ -417,6 +434,8 @@ def main() -> None:
         raise FileNotFoundError(f"Excel база не найдена: {batch_db_path}")
 
     batch_df = pd.read_excel(batch_db_path)
+    print("Колонки Excel:", list(batch_df.columns))
+    print(batch_df.head(10))
     parsed_lines = parse_pdf(pdf_path, work_dir, args.confidence_threshold)
     updated_batch_df, parsed_df = build_updates(parsed_lines, batch_df)
     save_results(output_path, updated_batch_df, parsed_df)
