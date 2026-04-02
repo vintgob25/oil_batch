@@ -14,6 +14,7 @@ from typing import Any
 import fitz  # PyMuPDF
 import pandas as pd
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
+from rapidfuzz import fuzz, process
 from dotenv import load_dotenv
 
 # =========================
@@ -24,6 +25,7 @@ BATCH_COL_NAME = "Batch"
 USED_COL_NAME = "Used"
 REVIEW_SHEET_NAME = "NEEDS_REVIEW"
 RESULTS_SHEET_NAME = "PARSED_LINES"
+SUGGESTED_SHEET_NAME = "SUGGESTED_MATCHES"
 OPENAI_MODEL_ENV = "OPENAI_VISION_MODEL"
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
@@ -435,6 +437,13 @@ def build_updates(parsed_lines: list[ParsedLine], batch_df: pd.DataFrame) -> tup
 
     batch_df = batch_df.copy()
     batch_df["_batch_norm"] = batch_df[BATCH_COL_NAME].astype(str).map(normalize_batch)
+    batch_norm_to_original: dict[str, list[str]] = {}
+    for _, batch_row in batch_df.iterrows():
+        batch_norm = normalize_batch(batch_row.get(BATCH_COL_NAME))
+        if not batch_norm:
+            continue
+        batch_norm_to_original.setdefault(batch_norm, []).append(str(batch_row.get(BATCH_COL_NAME, "")).strip())
+    fuzzy_candidates = list(batch_norm_to_original.keys())
 
     ok_rows = []
     review_rows = []
@@ -450,6 +459,8 @@ def build_updates(parsed_lines: list[ParsedLine], batch_df: pd.DataFrame) -> tup
         base_status = row.get("status", "review")
 
         out_row = row.to_dict()
+        out_row["suggested_batch"] = ""
+        out_row["similarity_score"] = None
 
         if base_status != "ok":
             out_row["review_note"] = "Низкая уверенность или batch пустой"
@@ -472,6 +483,21 @@ def build_updates(parsed_lines: list[ParsedLine], batch_df: pd.DataFrame) -> tup
         matched = batch_df[mask]
 
         if matched.empty:
+            if batch and fuzzy_candidates:
+                best_match = process.extractOne(batch, fuzzy_candidates, scorer=fuzz.ratio)
+                if best_match:
+                    best_batch_norm, similarity_score, _ = best_match
+                    out_row["similarity_score"] = float(similarity_score)
+                    if similarity_score >= 90:
+                        suggested_values = batch_norm_to_original.get(best_batch_norm, [])
+                        out_row["status"] = "suggested_match"
+                        out_row["suggested_batch"] = suggested_values[0] if suggested_values else best_batch_norm
+                        out_row["review_note"] = (
+                            "Точного совпадения нет. Предложен ближайший batch по fuzzy matching "
+                            f"(similarity={similarity_score:.1f})."
+                        )
+                        review_rows.append(out_row)
+                        continue
             out_row["status"] = "not_found"
             out_row["review_note"] = "Batch не найден в базе"
             review_rows.append(out_row)
@@ -506,6 +532,10 @@ def save_results(output_xlsx: Path, updated_batch_df: pd.DataFrame, parsed_df: p
 
         review_df = parsed_df[parsed_df["status"].isin(["review", "not_found"])] if not parsed_df.empty else parsed_df
         review_df.to_excel(writer, sheet_name=REVIEW_SHEET_NAME, index=False)
+        suggested_df = (
+            parsed_df[parsed_df["status"] == "suggested_match"] if not parsed_df.empty else parsed_df
+        )
+        suggested_df.to_excel(writer, sheet_name=SUGGESTED_SHEET_NAME, index=False)
 
 
 # =========================
