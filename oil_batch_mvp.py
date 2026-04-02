@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, asdict
@@ -11,7 +12,7 @@ from typing import Any
 
 import fitz  # PyMuPDF
 import pandas as pd
-from openpyxl import load_workbook
+from openai import OpenAI
 
 
 # =========================
@@ -22,6 +23,10 @@ BATCH_COL_NAME = "Batch"
 USED_COL_NAME = "Used"
 REVIEW_SHEET_NAME = "NEEDS_REVIEW"
 RESULTS_SHEET_NAME = "PARSED_LINES"
+OPENAI_MODEL_ENV = "OPENAI_VISION_MODEL"
+OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
+DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+logger = logging.getLogger(__name__)
 
 
 # =========================
@@ -123,11 +128,93 @@ def parse_page_with_ai(image_path: Path) -> list[dict[str, Any]]:
     - batch уже лучше просить модель возвращать без пробелов
     - если batch не читается, пусть возвращает ""
     """
-    _ = image_to_base64(image_path)
+    api_key = os.getenv(OPENAI_API_KEY_ENV, "").strip()
+    model_name = os.getenv(OPENAI_MODEL_ENV, DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
+    if not api_key:
+        logger.error("Переменная окружения %s не задана. AI-разбор пропущен.", OPENAI_API_KEY_ENV)
+        return []
 
-    # TODO: заменить на реальный вызов vision API.
-    # Пока возвращаем пустой список, чтобы скрипт был безопасным шаблоном.
-    return []
+    image_base64 = image_to_base64(image_path)
+    client = OpenAI(api_key=api_key)
+    prompt = (
+        "Ты анализируешь скан страницы заказа. "
+        "Найди все товарные строки и рукописные batch-коды рядом с каждой строкой. "
+        "Верни СТРОГО JSON-массив объектов: "
+        '[{"product":"...","qty_raw":"...","batch":"...","confidence":0.0,"reason":"..."}]. '
+        "Если batch не читается, верни пустую строку для batch и снизь confidence. "
+        "Не добавляй комментарии, markdown или другой текст."
+    )
+
+    try:
+        response = client.responses.create(
+            model=model_name,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": f"data:image/png;base64,{image_base64}"},
+                    ],
+                }
+            ],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "batch_rows",
+                    "schema": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "product": {"type": "string"},
+                                "qty_raw": {"type": "string"},
+                                "batch": {"type": "string"},
+                                "confidence": {"type": "number"},
+                                "reason": {"type": "string"},
+                            },
+                            "required": ["product", "qty_raw", "batch", "confidence", "reason"],
+                        },
+                    },
+                    "strict": True,
+                }
+            },
+        )
+    except Exception as exc:
+        logger.exception("Ошибка вызова vision-модели для %s: %s", image_path, exc)
+        return []
+
+    raw_text = getattr(response, "output_text", "") or ""
+    try:
+        payload = json.loads(raw_text)
+    except Exception as exc:
+        logger.exception("Невалидный JSON от модели для %s: %s; raw=%r", image_path, exc, raw_text[:500])
+        return []
+
+    if not isinstance(payload, list):
+        logger.error("Ожидался список объектов, но получено: %s", type(payload).__name__)
+        return []
+
+    normalized_items: list[dict[str, Any]] = []
+    for idx, item in enumerate(payload):
+        if not isinstance(item, dict):
+            logger.error("Элемент #%s не объект: %r", idx, item)
+            return []
+        try:
+            normalized_items.append(
+                {
+                    "product": str(item.get("product", "")).strip(),
+                    "qty_raw": str(item.get("qty_raw", "")).strip(),
+                    "batch": normalize_batch(str(item.get("batch", ""))),
+                    "confidence": float(item.get("confidence", 0.0) or 0.0),
+                    "reason": str(item.get("reason", "")).strip(),
+                }
+            )
+        except Exception as exc:
+            logger.exception("Не удалось нормализовать элемент #%s: %r, err=%s", idx, item, exc)
+            return []
+
+    return normalized_items
 
 
 # =========================
@@ -286,6 +373,7 @@ def save_results(output_xlsx: Path, updated_batch_df: pd.DataFrame, parsed_df: p
 # CLI
 # =========================
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description="MVP: разбор PDF заказов и обновление базы batch/used")
     parser.add_argument("--pdf", required=True, help="Путь к PDF файлу")
     parser.add_argument("--batch-db", required=True, help="Путь к Excel базе batch")
