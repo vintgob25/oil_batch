@@ -1,70 +1,73 @@
-# oil_batch MVP
+# oil_batch MVP (Windows quick start)
 
-MVP-скрипт для извлечения товарных строк из PDF-заказов и обновления Excel-базы batch/used.
+Этот проект нужен для первого локального прогона:
+- берёт `ntcnpdf.pdf`,
+- парсит строки заказа через vision-модель,
+- обновляет `Example.xlsx`,
+- создаёт `result.xlsx`.
 
-## Что делает
+## 1) Установить Python
 
-`oil_batch_mvp.py`:
-- конвертирует страницы PDF в PNG;
-- отправляет каждую страницу в vision-модель;
-- получает по каждой строке заказа:
-  - `product`
-  - `qty_raw`
-  - `batch`
-  - `confidence`
-  - `reason`
-- нормализует batch-коды и confidence;
-- обновляет колонку `Used` в базе по найденным batch;
-- сохраняет итоговый Excel с листами:
-  - `BATCH_DB_UPDATED`
-  - `PARSED_LINES`
-  - `NEEDS_REVIEW`
+1. Скачайте Python 3.10+ с официального сайта: https://www.python.org/downloads/windows/  
+2. При установке обязательно включите галочку **Add Python to PATH**.
 
-## Требования
+Проверка в PowerShell:
 
-- Python 3.10+
-- OpenAI API key
+```powershell
+python --version
+```
 
-Установка зависимостей:
+## 2) Открыть папку проекта
 
-```bash
+В PowerShell:
+
+```powershell
+cd C:\path\to\oil_batch
+```
+
+## 3) Создать `.env` из `.env.example`
+
+```powershell
+copy .env.example .env
+notepad .env
+```
+
+Вставьте ваш API-ключ в `OPENAI_API_KEY`.
+
+## 4) Установить зависимости
+
+Рекомендуется через виртуальное окружение:
+
+```powershell
 python -m venv .venv
-source .venv/bin/activate
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Переменные окружения
+## 5) Положить входные файлы рядом со скриптом
 
-- `OPENAI_API_KEY` — API ключ (обязательно)
-- `OPENAI_VISION_MODEL` — имя модели (опционально, по умолчанию `gpt-4.1-mini`)
-- `OIL_BATCH_DEBUG_DIR` — опционально, папка для debug JSON по страницам (raw/normalized ответы модели)
+В папке проекта должны лежать:
+- `oil_batch_mvp.py`
+- `ntcnpdf.pdf`
+- `Example.xlsx`
 
-Пример:
+## 6) Запуск одной командой
 
-```bash
-cp .env.example .env
-# отредактируйте .env
-set -a
-source .env
-set +a
+```powershell
+python oil_batch_mvp.py --pdf .\ntcnpdf.pdf --batch-db .\Example.xlsx --out .\result.xlsx
 ```
 
-## Запуск
+После успешного запуска появится файл:
+- `result.xlsx`
 
-```bash
-python oil_batch_mvp.py \
-  --pdf ./sample.pdf \
-  --batch-db ./Example.xlsx \
-  --out ./result.xlsx
+---
+
+## Пример готового `.env`
+
+```env
+OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxx
+OPENAI_VISION_MODEL=gpt-4.1-mini
+OIL_BATCH_DEBUG_DIR=.\work\debug_ai
 ```
 
-Опционально:
-
-```bash
-python oil_batch_mvp.py \
-  --pdf ./sample.pdf \
-  --batch-db ./Example.xlsx \
-  --out ./result.xlsx \
-  --work-dir ./work \
-  --confidence-threshold 0.85
-```
+`OIL_BATCH_DEBUG_DIR` можно оставить пустым, если debug-json не нужен.
