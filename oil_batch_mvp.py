@@ -352,7 +352,11 @@ def build_updates(parsed_lines: list[ParsedLine], batch_df: pd.DataFrame) -> tup
     for _, row in df.iterrows():
         batch = normalize_batch(row.get("batch"))
         qty_value = row.get("qty_value")
-        qty_unit = (row.get("qty_unit") or "").lower()
+        qty_unit_raw = row.get("qty_unit")
+        if pd.isna(qty_unit_raw):
+            qty_unit = ""
+        else:
+            qty_unit = str(qty_unit_raw).lower()
         base_status = row.get("status", "review")
 
         out_row = row.to_dict()
