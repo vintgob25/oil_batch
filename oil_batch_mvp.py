@@ -1,0 +1,316 @@
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any
+
+import fitz  # PyMuPDF
+import pandas as pd
+from openpyxl import load_workbook
+
+
+# =========================
+# CONFIG
+# =========================
+SUPPORTED_IMAGE_EXT = {".png", ".jpg", ".jpeg"}
+BATCH_COL_NAME = "Batch"
+USED_COL_NAME = "Used"
+REVIEW_SHEET_NAME = "NEEDS_REVIEW"
+RESULTS_SHEET_NAME = "PARSED_LINES"
+
+
+# =========================
+# DATA MODELS
+# =========================
+@dataclass
+class ParsedLine:
+    pdf_file: str
+    page: int
+    product: str
+    qty_raw: str
+    qty_value: float | None
+    qty_unit: str | None
+    batch: str
+    confidence: float
+    reason: str
+    status: str  # ok / review / not_found / skipped
+
+
+# =========================
+# HELPERS
+# =========================
+def normalize_batch(value: str | None) -> str:
+    if not value:
+        return ""
+    value = value.upper().strip()
+    value = re.sub(r"\s+", "", value)
+    value = re.sub(r"[^A-Z0-9-]", "", value)
+    return value
+
+
+
+def parse_qty(qty_raw: str | None) -> tuple[float | None, str | None]:
+    if not qty_raw:
+        return None, None
+
+    text = qty_raw.strip().lower()
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(oz|lb|lbs|ml|l)?", text)
+    if not m:
+        return None, None
+
+    value = float(m.group(1))
+    unit = (m.group(2) or "").lower() or None
+    return value, unit
+
+
+
+def ensure_required_columns(df: pd.DataFrame) -> None:
+    missing = [c for c in (BATCH_COL_NAME, USED_COL_NAME) if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"В базе нет обязательных колонок: {missing}. Ожидаю минимум '{BATCH_COL_NAME}' и '{USED_COL_NAME}'."
+        )
+
+
+
+def pdf_to_images(pdf_path: Path, output_dir: Path, dpi: int = 200) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    doc = fitz.open(pdf_path)
+    image_paths: list[Path] = []
+
+    for page_index in range(len(doc)):
+        page = doc.load_page(page_index)
+        pix = page.get_pixmap(dpi=dpi)
+        img_path = output_dir / f"{pdf_path.stem}_page_{page_index + 1}.png"
+        pix.save(img_path)
+        image_paths.append(img_path)
+
+    return image_paths
+
+
+
+def image_to_base64(image_path: Path) -> str:
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+# =========================
+# AI PARSER
+# =========================
+def parse_page_with_ai(image_path: Path) -> list[dict[str, Any]]:
+    """
+    MVP-заглушка.
+
+    Здесь нужно подключить vision-модель.
+    Она должна вернуть JSON-список по всем строкам заказа на странице.
+
+    Ожидаемый формат каждого элемента:
+    {
+      "product": "Abyssinian Oil",
+      "qty_raw": "16 oz",
+      "batch": "ABSNCACAC001A",
+      "confidence": 0.97,
+      "reason": "clear handwritten batch near product row"
+    }
+
+    ВАЖНО:
+    - confidence от 0 до 1
+    - batch уже лучше просить модель возвращать без пробелов
+    - если batch не читается, пусть возвращает ""
+    """
+    _ = image_to_base64(image_path)
+
+    # TODO: заменить на реальный вызов vision API.
+    # Пока возвращаем пустой список, чтобы скрипт был безопасным шаблоном.
+    return []
+
+
+# =========================
+# PIPELINE
+# =========================
+def parse_pdf(pdf_path: Path, work_dir: Path, confidence_threshold: float) -> list[ParsedLine]:
+    images_dir = work_dir / "pages"
+    image_paths = pdf_to_images(pdf_path, images_dir)
+
+    results: list[ParsedLine] = []
+
+    for page_no, image_path in enumerate(image_paths, start=1):
+        raw_items = parse_page_with_ai(image_path)
+
+        if not raw_items:
+            results.append(
+                ParsedLine(
+                    pdf_file=pdf_path.name,
+                    page=page_no,
+                    product="",
+                    qty_raw="",
+                    qty_value=None,
+                    qty_unit=None,
+                    batch="",
+                    confidence=0.0,
+                    reason="AI parser returned no rows",
+                    status="review",
+                )
+            )
+            continue
+
+        for item in raw_items:
+            product = str(item.get("product", "")).strip()
+            qty_raw = str(item.get("qty_raw", "")).strip()
+            batch = normalize_batch(str(item.get("batch", "")))
+            confidence = float(item.get("confidence", 0.0) or 0.0)
+            reason = str(item.get("reason", "")).strip()
+            qty_value, qty_unit = parse_qty(qty_raw)
+
+            if not batch or confidence < confidence_threshold:
+                status = "review"
+            else:
+                status = "ok"
+
+            results.append(
+                ParsedLine(
+                    pdf_file=pdf_path.name,
+                    page=page_no,
+                    product=product,
+                    qty_raw=qty_raw,
+                    qty_value=qty_value,
+                    qty_unit=qty_unit,
+                    batch=batch,
+                    confidence=confidence,
+                    reason=reason,
+                    status=status,
+                )
+            )
+
+    return results
+
+
+
+def build_updates(parsed_lines: list[ParsedLine], batch_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    ensure_required_columns(batch_df)
+
+    df = pd.DataFrame([asdict(x) for x in parsed_lines])
+    if df.empty:
+        df = pd.DataFrame(
+            columns=[
+                "pdf_file",
+                "page",
+                "product",
+                "qty_raw",
+                "qty_value",
+                "qty_unit",
+                "batch",
+                "confidence",
+                "reason",
+                "status",
+            ]
+        )
+
+    batch_df = batch_df.copy()
+    batch_df["_batch_norm"] = batch_df[BATCH_COL_NAME].astype(str).map(normalize_batch)
+
+    ok_rows = []
+    review_rows = []
+
+    for _, row in df.iterrows():
+        batch = normalize_batch(row.get("batch"))
+        qty_value = row.get("qty_value")
+        qty_unit = (row.get("qty_unit") or "").lower()
+        base_status = row.get("status", "review")
+
+        out_row = row.to_dict()
+
+        if base_status != "ok":
+            out_row["review_note"] = "Низкая уверенность или batch пустой"
+            review_rows.append(out_row)
+            continue
+
+        if qty_value is None:
+            out_row["status"] = "review"
+            out_row["review_note"] = "Не удалось распарсить количество"
+            review_rows.append(out_row)
+            continue
+
+        if qty_unit not in {"oz", ""}:
+            out_row["status"] = "review"
+            out_row["review_note"] = f"Пока автоматически обновляем только oz. Найдено: {qty_unit}"
+            review_rows.append(out_row)
+            continue
+
+        mask = batch_df["_batch_norm"] == batch
+        matched = batch_df[mask]
+
+        if matched.empty:
+            out_row["status"] = "not_found"
+            out_row["review_note"] = "Batch не найден в базе"
+            review_rows.append(out_row)
+            continue
+
+        if len(matched) > 1:
+            out_row["status"] = "review"
+            out_row["review_note"] = "В базе найдено несколько одинаковых batch"
+            review_rows.append(out_row)
+            continue
+
+        idx = matched.index[0]
+        current_used = batch_df.at[idx, USED_COL_NAME]
+        current_used = 0 if pd.isna(current_used) else float(current_used)
+        batch_df.at[idx, USED_COL_NAME] = current_used + float(qty_value)
+
+        out_row["status"] = "updated"
+        out_row["review_note"] = "Used увеличен автоматически"
+        ok_rows.append(out_row)
+
+    batch_df = batch_df.drop(columns=["_batch_norm"])
+    ok_df = pd.DataFrame(ok_rows)
+    review_df = pd.DataFrame(review_rows)
+    return batch_df, pd.concat([ok_df, review_df], ignore_index=True)
+
+
+
+def save_results(output_xlsx: Path, updated_batch_df: pd.DataFrame, parsed_df: pd.DataFrame) -> None:
+    with pd.ExcelWriter(output_xlsx, engine="openpyxl") as writer:
+        updated_batch_df.to_excel(writer, sheet_name="BATCH_DB_UPDATED", index=False)
+        parsed_df.to_excel(writer, sheet_name=RESULTS_SHEET_NAME, index=False)
+
+        review_df = parsed_df[parsed_df["status"].isin(["review", "not_found"])] if not parsed_df.empty else parsed_df
+        review_df.to_excel(writer, sheet_name=REVIEW_SHEET_NAME, index=False)
+
+
+# =========================
+# CLI
+# =========================
+def main() -> None:
+    parser = argparse.ArgumentParser(description="MVP: разбор PDF заказов и обновление базы batch/used")
+    parser.add_argument("--pdf", required=True, help="Путь к PDF файлу")
+    parser.add_argument("--batch-db", required=True, help="Путь к Excel базе batch")
+    parser.add_argument("--out", default="result.xlsx", help="Куда сохранить результат")
+    parser.add_argument("--work-dir", default="./work", help="Временная рабочая папка")
+    parser.add_argument("--confidence-threshold", type=float, default=0.85)
+    args = parser.parse_args()
+
+    pdf_path = Path(args.pdf)
+    batch_db_path = Path(args.batch_db)
+    output_path = Path(args.out)
+    work_dir = Path(args.work_dir)
+
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF не найден: {pdf_path}")
+    if not batch_db_path.exists():
+        raise FileNotFoundError(f"Excel база не найдена: {batch_db_path}")
+
+    batch_df = pd.read_excel(batch_db_path)
+    parsed_lines = parse_pdf(pdf_path, work_dir, args.confidence_threshold)
+    updated_batch_df, parsed_df = build_updates(parsed_lines, batch_df)
+    save_results(output_path, updated_batch_df, parsed_df)
+
+    print(f"Готово. Результат сохранён в: {output_path}")
+
+
+if __name__ == "__main__":
+    main()
